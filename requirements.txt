@@ -1,0 +1,9 @@
+streamlit==1.32.0
+langchain==0.3.20
+langchain-openai==0.3.8
+openai==1.66.3
+tiktoken==0.9.0
+pydantic==2.10.6
+numpy>=1.19.3,<2
+chromadb==0.6.3
+python-dotenv==1.0.1
