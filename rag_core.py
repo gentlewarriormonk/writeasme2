@@ -7,7 +7,7 @@ to simplify deployment to Streamlit Cloud.
 import os
 import logging
 import json
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 from pathlib import Path
 import tempfile
 import re
@@ -16,19 +16,41 @@ import re
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Try importing required packages
+# Try importing required packages - Wrap each import in try/except
+openai_imports_success = False
 try:
     from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+    openai_imports_success = True
+except ImportError as e:
+    logger.error(f"Error importing OpenAI packages: {str(e)}")
+    logger.info("Please install required packages: pip install langchain-openai")
+
+langchain_imports_success = False
+try:
     from langchain.text_splitter import RecursiveCharacterTextSplitter
     from langchain.prompts import ChatPromptTemplate
     from langchain.schema import StrOutputParser
     from langchain.schema.runnable import RunnablePassthrough
+    langchain_imports_success = True
+except ImportError as e:
+    logger.error(f"Error importing LangChain packages: {str(e)}")
+    logger.info("Please install required packages: pip install langchain")
+
+chromadb_import_success = False
+try:
     import chromadb
     from chromadb.utils import embedding_functions
+    chromadb_import_success = True
 except ImportError as e:
-    logger.error(f"Error importing required packages: {str(e)}")
-    logger.info("Please install required packages: pip install langchain langchain-openai openai chromadb")
-    raise
+    logger.error(f"Error importing ChromaDB: {str(e)}")
+    logger.info("Please install chromadb: pip install chromadb==0.4.22")  # Using a specific version known to be stable
+
+# Check if all required imports were successful
+all_imports_success = openai_imports_success and langchain_imports_success and chromadb_import_success
+if not all_imports_success:
+    logger.error("Not all required packages could be imported.")
+    logger.info("Please install required packages: pip install langchain langchain-openai openai chromadb==0.4.22")
+
 
 class TextProcessor:
     """Process text files into chunks with metadata."""
@@ -41,6 +63,9 @@ class TextProcessor:
             chunk_size: Target size of text chunks in words
             chunk_overlap: Overlap between chunks in words
         """
+        if not langchain_imports_success:
+            raise ImportError("Required LangChain packages are not available")
+            
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.text_splitter = RecursiveCharacterTextSplitter(
@@ -185,6 +210,12 @@ class VectorStore:
             embedding_model: Name of the embedding model to use
             collection_name: Name of the collection in the database
         """
+        if not chromadb_import_success:
+            raise ImportError("ChromaDB is not available")
+            
+        if not openai_imports_success:
+            raise ImportError("OpenAI packages are not available")
+            
         self.persist_directory = persist_directory
         self.embedding_model = embedding_model
         self.collection_name = collection_name
@@ -204,17 +235,20 @@ class VectorStore:
         
         # Initialize ChromaDB client
         try:
-            self.client = chromadb.PersistentClient(path=persist_directory)
+            try:
+                self.client = chromadb.PersistentClient(path=persist_directory)
+            except TypeError:
+                self.client = chromadb.PersistentClient(persist_directory=persist_directory)
             logger.info(f"Initialized ChromaDB client with persist_directory={persist_directory}")
         except Exception as e:
             logger.error(f"Error initializing ChromaDB client: {str(e)}")
             raise
         
-        # Get or create collection
+        # Get or create collection using the available embedding function
         try:
             self.collection = self.client.get_or_create_collection(
                 name=collection_name,
-                embedding_function=embedding_functions.DefaultEmbeddingFunction()
+                embedding_function=self.embeddings  # use OpenAI or default embedding function
             )
             logger.info(f"Using collection {collection_name}")
         except Exception as e:
@@ -233,18 +267,16 @@ class VectorStore:
                 logger.warning("No chunks to add")
                 return
             
-            # Prepare data for ChromaDB
             ids = []
             documents = []
             metadatas = []
             
             for i, chunk in enumerate(chunks):
-                chunk_id = f"chunk_{len(ids) + i}"
+                chunk_id = f"chunk_{i}"
                 ids.append(chunk_id)
                 documents.append(chunk["text"])
                 metadatas.append(chunk["metadata"])
             
-            # Add to collection
             self.collection.add(
                 ids=ids,
                 documents=documents,
@@ -268,13 +300,11 @@ class VectorStore:
             List of dictionaries containing text chunks and metadata
         """
         try:
-            # Query collection
             results = self.collection.query(
                 query_texts=[query],
                 n_results=n_results
             )
             
-            # Format results
             formatted_results = []
             if results["documents"] and len(results["documents"]) > 0:
                 for i, doc in enumerate(results["documents"][0]):
@@ -297,21 +327,16 @@ class VectorStore:
             Dictionary containing statistics
         """
         try:
-            # Get all items in collection
             all_items = self.collection.get()
             
-            # Count documents
             total_documents = len(all_items["ids"]) if "ids" in all_items else 0
             
-            # Count content types
             content_types = {}
             if "metadatas" in all_items and all_items["metadatas"]:
                 for metadata in all_items["metadatas"]:
                     if metadata and "content_type" in metadata:
                         content_type = metadata["content_type"]
-                        if content_type not in content_types:
-                            content_types[content_type] = 0
-                        content_types[content_type] += 1
+                        content_types[content_type] = content_types.get(content_type, 0) + 1
             
             stats = {
                 "total_documents": total_documents,
@@ -332,13 +357,9 @@ class VectorStore:
             output_file: Path to save the state
         """
         try:
-            # Get all items in collection
             all_items = self.collection.get()
-            
-            # Save to file
             with open(output_file, 'w', encoding='utf-8') as f:
                 json.dump(all_items, f)
-            
             logger.info(f"Saved collection state to {output_file}")
         except Exception as e:
             logger.error(f"Error saving state: {str(e)}")
@@ -352,392 +373,24 @@ class VectorStore:
             input_file: Path to load the state from
         """
         try:
-            # Check if file exists
             if not os.path.exists(input_file):
                 logger.warning(f"File {input_file} does not exist")
                 return
             
-            # Load from file
             with open(input_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             
-            # Clear collection
+            # Clear the existing collection
             self.collection.delete(where={})
             
-            # Add items to collection
+            # Add items from the loaded state
             if "ids" in data and data["ids"]:
                 self.collection.add(
                     ids=data["ids"],
                     documents=data["documents"],
                     metadatas=data["metadatas"]
                 )
-            
-            logger.info(f"Loaded collection state from {input_file} with {len(data['ids'])} items")
-        except Exception as e:
-            logger.error(f"Error loading state: {str(e)}")
-            raise
-
-
-class LanguageModelIntegration:
-    """Integration with language models for generating content."""
-    
-    def __init__(self, 
-                 model_name: str = "gpt-4o",
-                 temperature: float = 0.7,
-                 max_tokens: int = 1000):
-        """
-        Initialize the language model integration.
-        
-        Args:
-            model_name: Name of the model to use
-            temperature: Temperature for generation (0.0 to 1.0)
-            max_tokens: Maximum tokens to generate
-        """
-        self.model_name = model_name
-        self.temperature = temperature
-        self.max_tokens = max_tokens
-        
-        # Initialize language model
-        self.llm = self._initialize_llm()
-        
-        logger.info(f"Initialized LanguageModelIntegration with model={model_name}")
-    
-    def _initialize_llm(self):
-        """
-        Initialize the language model.
-        
-        Returns:
-            An initialized language model
-        """
-        try:
-            llm = ChatOpenAI(
-                model=self.model_name,
-                temperature=self.temperature,
-                max_tokens=self.max_tokens
-            )
-            logger.info(f"Initialized OpenAI model: {self.model_name}")
-            return llm
-        except Exception as e:
-            logger.error(f"Error initializing language model: {str(e)}")
-            raise
-    
-    def _get_style_guidance(self, query):
-        """
-        Extract style guidance from the query if present.
-        
-        Args:
-            query: The user query
-            
-        Returns:
-            Style guidance string or empty string
-        """
-        # Look for style instructions in brackets or parentheses
-        style_markers = [
-            (r'\[make this (.*?)\]', r'Style adjustment: \1'),
-            (r'\(make this (.*?)\)', r'Style adjustment: \1'),
-            (r'make this (more|less) (\w+)', r'Style adjustment: \1 \2')
-        ]
-        
-        guidance = ""
-        
-        for pattern, replacement in style_markers:
-            match = re.search(pattern, query, re.IGNORECASE)
-            if match:
-                guidance = re.sub(pattern, replacement, query, flags=re.IGNORECASE)
-                break
-        
-        if guidance:
-            return f"Style guidance: {guidance}"
-        return ""
-    
-    def generate_with_style(self, query: str, context_docs: List[Dict[str, Any]], style_adjustments: Optional[str] = None) -> str:
-        """
-        Generate content based on query and context with optional style adjustments.
-        
-        Args:
-            query: The user query
-            context_docs: List of context documents
-            style_adjustments: Optional style adjustment instructions
-            
-        Returns:
-            Generated content
-        """
-        try:
-            # Format context from documents
-            context = self._format_context_from_docs(context_docs)
-            
-            # Add style adjustments if provided
-            style_guidance = ""
-            if style_adjustments:
-                style_guidance = f"Style guidance: {style_adjustments}"
-            
-            # Create the prompt
-            prompt = f"""
-You are a writing assistant that mimics the style and voice of the user based on their previous writings.
-Your goal is to generate new content that sounds authentically like the user wrote it.
-
-Here are relevant examples of the user's writing style:
-
-{context}
-
-Based on these examples, please write a response to the following request in the user's authentic voice:
-
-{query}
-
-{style_guidance}
-
-Remember to maintain the user's unique voice, vocabulary choices, sentence structures, and thematic preferences.
-"""
-            
-            # Generate response
-            response = self.llm.invoke(prompt)
-            
-            # Extract content from response
-            if hasattr(response, 'content'):
-                content = response.content
-            else:
-                content = str(response)
-            
-            logger.info(f"Generated content for query: {query[:50]}...")
-            return content
-        except Exception as e:
-            logger.error(f"Error generating content: {str(e)}")
-            raise
-    
-    def _format_context_from_docs(self, docs: List[Dict[str, Any]]) -> str:
-        """
-        Format context from retrieved documents.
-        
-        Args:
-            docs: List of document dictionaries
-            
-        Returns:
-            Formatted context string
-        """
-        formatted_context = ""
-        
-        for i, doc in enumerate(docs):
-            text = doc.get("text", "")
-            metadata = doc.get("metadata", {})
-            
-            content_type = metadata.get("content_type", "unknown")
-            title = metadata.get("title", f"Document {i+1}")
-            
-            formatted_context += f"--- Example {i+1} (Content type: {content_type}) ---\n"
-            formatted_context += f"Title: {title}\n\n"
-            formatted_context += f"{text}\n\n"
-        
-        return formatted_context
-
-
-class RAGWritingAssistant:
-    """Main class that integrates all components of the RAG writing assistant."""
-    
-    def __init__(self, 
-                 corpus_directory: str,
-                 vector_db_directory: str,
-                 embedding_model: str = "text-embedding-3-small",
-                 llm_model: str = "gpt-4o",
-                 collection_name: str = "user_writings"):
-        """
-        Initialize the RAG writing assistant with all components.
-        
-        Args:
-            corpus_directory: Directory containing the user's text files
-            vector_db_directory: Directory to store the vector database
-            embedding_model: Name of the embedding model to use
-            llm_model: Name of the language model to use
-            collection_name: Name of the collection in the vector database
-        """
-        self.corpus_directory = corpus_directory
-        self.vector_db_directory = vector_db_directory
-        self.embedding_model = embedding_model
-        self.llm_model = llm_model
-        self.collection_name = collection_name
-        
-        # Create directories if they don't exist
-        os.makedirs(corpus_directory, exist_ok=True)
-        os.makedirs(vector_db_directory, exist_ok=True)
-        
-        # Initialize components
-        self.text_processor = TextProcessor(chunk_size=750, chunk_overlap=150)
-        self.vector_store = VectorStore(
-            persist_directory=vector_db_directory,
-            embedding_model=embedding_model,
-            collection_name=collection_name
-        )
-        self.language_model = LanguageModelIntegration(
-            model_name=llm_model,
-            temperature=0.7
-        )
-        
-        logger.info(f"Initialized RAG Writing Assistant with corpus_directory={corpus_directory}, "
-                   f"vector_db_directory={vector_db_directory}, embedding_model={embedding_model}, "
-                   f"llm_model={llm_model}")
-    
-    def process_corpus(self, reprocess: bool = False) -> int:
-        """
-        Process the corpus directory and add to vector database.
-        
-        Args:
-            reprocess: Whether to reprocess existing files
-            
-        Returns:
-            Number of chunks processed
-        """
-        try:
-            # Check if we need to process the corpus
-            stats = self.vector_store.get_collection_stats()
-            if stats["total_documents"] > 0 and not reprocess:
-                logger.info(f"Using existing vector database with {stats['total_documents']} documents")
-                return stats["total_documents"]
-            
-            # Process the corpus
-            logger.info(f"Processing corpus directory: {self.corpus_directory}")
-            chunks = self.text_processor.process_directory(self.corpus_directory)
-            
-            # Clear existing collection if reprocessing
-            if reprocess and stats["total_documents"] > 0:
-                logger.info("Clearing existing vector database for reprocessing")
-                self.vector_store.collection.delete(where={})
-            
-            # Add to vector database
-            if chunks:
-                logger.info(f"Adding {len(chunks)} chunks to vector database")
-                self.vector_store.add_texts(chunks)
-                return len(chunks)
-            else:
-                logger.warning(f"No text files found in {self.corpus_directory}")
-                return 0
-        except Exception as e:
-            logger.error(f"Error processing corpus: {str(e)}")
-            raise
-    
-    def add_file(self, file_path: str) -> int:
-        """
-        Process a single file and add to vector database.
-        
-        Args:
-            file_path: Path to the text file
-            
-        Returns:
-            Number of chunks processed
-        """
-        try:
-            logger.info(f"Processing file: {file_path}")
-            chunks = self.text_processor.process_file(file_path)
-            
-            if chunks:
-                logger.info(f"Adding {len(chunks)} chunks to vector database")
-                self.vector_store.add_texts(chunks)
-                return len(chunks)
-            else:
-                logger.warning(f"No chunks created from {file_path}")
-                return 0
-        except Exception as e:
-            logger.error(f"Error processing file: {str(e)}")
-            raise
-    
-    def generate_content(self, query: str, style_adjustments: Optional[str] = None, n_results: int = 5) -> str:
-        """
-        Generate content based on query with optional style adjustments.
-        
-        Args:
-            query: The user query
-            style_adjustments: Optional style adjustment instructions
-            n_results: Number of similar documents to retrieve
-            
-        Returns:
-            Generated content
-        """
-        try:
-            # Get context documents
-            context_docs = self.vector_store.similarity_search(query, n_results=n_results)
-            
-            if not context_docs:
-                logger.warning("No relevant documents found in vector database")
-                return "I don't have enough context to generate content in your style. Please add more text files to your corpus."
-            
-            # Generate content
-            content = self.language_model.generate_with_style(query, context_docs, style_adjustments)
-            
-            logger.info(f"Generated content for query: {query[:50]}...")
-            return content
-        except Exception as e:
-            logger.error(f"Error generating content: {str(e)}")
-            raise
-    
-    def get_corpus_stats(self) -> Dict[str, Any]:
-        """
-        Get statistics about the corpus and vector database.
-        
-        Returns:
-            Dictionary containing statistics
-        """
-        try:
-            # Get vector database stats
-            vector_stats = self.vector_store.get_collection_stats()
-            
-            # Get corpus file stats
-            file_count = 0
-            file_types = {}
-            
-            if os.path.exists(self.corpus_directory):
-                files = [f for f in os.listdir(self.corpus_directory) if f.endswith('.txt')]
-                file_count = len(files)
-                
-                for file in files:
-                    # Try to determine file type from name
-                    file_type = "unknown"
-                    if "essay" in file.lower():
-                        file_type = "essay"
-                    elif "podcast" in file.lower():
-                        file_type = "podcast"
-                    elif "substack" in file.lower() or "newsletter" in file.lower():
-                        file_type = "newsletter"
-                    elif "reflection" in file.lower():
-                        file_type = "reflection"
-                    
-                    if file_type not in file_types:
-                        file_types[file_type] = 0
-                    file_types[file_type] += 1
-            
-            stats = {
-                "corpus_files": file_count,
-                "file_types": file_types,
-                "vector_documents": vector_stats["total_documents"],
-                "content_types": vector_stats["content_types"]
-            }
-            
-            logger.info(f"Corpus stats: {stats}")
-            return stats
-        except Exception as e:
-            logger.error(f"Error getting corpus stats: {str(e)}")
-            raise
-    
-    def save_state(self) -> None:
-        """
-        Save the current state of the vector database.
-        """
-        try:
-            output_file = os.path.join(self.vector_db_directory, "vector_store_data.json")
-            self.vector_store.save_to_disk(output_file)
-            logger.info(f"Saved vector store state to {output_file}")
-        except Exception as e:
-            logger.error(f"Error saving state: {str(e)}")
-            raise
-    
-    def load_state(self) -> None:
-        """
-        Load the saved state of the vector database.
-        """
-        try:
-            input_file = os.path.join(self.vector_db_directory, "vector_store_data.json")
-            if os.path.exists(input_file):
-                self.vector_store.load_from_disk(input_file)
-                logger.info(f"Loaded vector store state from {input_file}")
-            else:
-                logger.warning(f"No saved state found at {input_file}")
+            logger.info(f"Loaded collection state from {input_file}")
         except Exception as e:
             logger.error(f"Error loading state: {str(e)}")
             raise
